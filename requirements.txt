@@ -1,0 +1,29 @@
+<<<<<<< HEAD
+azure-core==1.41.0
+azure-storage-blob==12.30.0
+certifi==2026.6.17
+cffi==2.1.0
+charset-normalizer==3.4.9
+cryptography==49.0.0
+dotenv==0.9.9
+idna==3.18
+isodate==0.7.2
+numpy==2.5.1
+pandas==3.0.3
+pycparser==3.0
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+requests==2.34.2
+six==1.17.0
+typing_extensions==4.16.0
+=======
+certifi==2026.6.17
+charset-normalizer==3.4.9
+idna==3.18
+numpy==2.5.1
+pandas==3.0.3
+python-dateutil==2.9.0.post0
+requests==2.34.2
+six==1.17.0
+>>>>>>> local
+urllib3==2.7.0
