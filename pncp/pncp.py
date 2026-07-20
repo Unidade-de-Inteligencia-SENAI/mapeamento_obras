@@ -6,10 +6,12 @@ script Python puro em Linux, sem Spark/dbutils/Unity Catalog.
 
 Saídas:
   - local:
-      data/bronze_pncp_contratacoes.jsonl   (payload bruto, 1 JSON por linha)
-      data/silver_pncp_contratacoes_obras.csv (tabela tratada, achatada)
+      data/bronze/bronze_pncp_contratacoes.jsonl   (payload bruto, 1 JSON por linha)
+      data/bronze/checkpoint_pncp.json             (controle de retomada da ingestão)
+      data/silver/silver_pncp_contratacoes_obras.csv (tabela tratada, achatada)
   - Azure Blob Storage (opcional, ver .env):
-      mesmos dois arquivos, subidos para {AZURE_STORAGE_CONTAINER}/{AZURE_BLOB_PREFIX}/
+      {AZURE_STORAGE_CONTAINER}/{AZURE_BLOB_PREFIX}/bronze/bronze_pncp_contratacoes.jsonl
+      {AZURE_STORAGE_CONTAINER}/{AZURE_BLOB_PREFIX}/silver/silver_pncp_contratacoes_obras.csv
 
 Dependências extras:
   pip install python-dotenv azure-storage-blob
@@ -73,9 +75,11 @@ load_dotenv(os.path.join(BASE_DIR, "..", ".env"))  # lê o .env da raiz do proje
 PNCP_BASE = "https://pncp.gov.br/api/consulta"
 DELAY_ENTRE_REQUESTS = 1.5  # segundos entre chamadas, para não estourar rate limit
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))  # .../data/
-BRONZE_PATH = os.path.join(DATA_DIR, "bronze_pncp_contratacoes.jsonl")
-SILVER_PATH = os.path.join(DATA_DIR, "silver_pncp_contratacoes_obras.csv")
-CHECKPOINT_PATH = os.path.join(DATA_DIR, "checkpoint_pncp.json")
+BRONZE_DIR = os.path.join(DATA_DIR, "bronze")
+SILVER_DIR = os.path.join(DATA_DIR, "silver")
+BRONZE_PATH = os.path.join(BRONZE_DIR, "bronze_pncp_contratacoes.jsonl")
+SILVER_PATH = os.path.join(SILVER_DIR, "silver_pncp_contratacoes_obras.csv")
+CHECKPOINT_PATH = os.path.join(BRONZE_DIR, "checkpoint_pncp.json")  # fica junto do bronze — controla a ingestão
 
 # ── Config Azure Blob Storage (tudo vem do .env, nunca hardcoded) ─────────
 # Opção A (mais simples): AZURE_STORAGE_CONNECTION_STRING sozinha
@@ -120,7 +124,7 @@ def carregar_checkpoint() -> set:
 
 
 def salvar_checkpoint(chaves: set):
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(BRONZE_DIR, exist_ok=True)
     with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
         json.dump(sorted(chaves), f, ensure_ascii=False)
 
@@ -159,9 +163,10 @@ def get_blob_service_client():
         return None
 
 
-def upload_para_blob(local_path: str, nome_arquivo: str) -> bool:
+def upload_para_blob(local_path: str, nome_arquivo: str, subpasta: str = "") -> bool:
     """
-    Sobe local_path para {AZURE_CONTAINER}/{AZURE_BLOB_PREFIX}/{nome_arquivo}.
+    Sobe local_path para {AZURE_CONTAINER}/{AZURE_BLOB_PREFIX}/{subpasta}/{nome_arquivo}.
+    Ex: subpasta="bronze" com AZURE_BLOB_PREFIX="pncp" → container/pncp/bronze/arquivo.jsonl
     Sempre sobrescreve o blob (o arquivo local já reflete o estado atual,
     seja modo append ou overwrite). Retorna True/False — nunca derruba o
     pipeline principal se o upload falhar (o CSV/JSONL local já está salvo).
@@ -174,7 +179,8 @@ def upload_para_blob(local_path: str, nome_arquivo: str) -> bool:
         print(f"    ⚠️  Arquivo local não encontrado para upload: {local_path}")
         return False
 
-    blob_name = f"{AZURE_BLOB_PREFIX}/{nome_arquivo}" if AZURE_BLOB_PREFIX else nome_arquivo
+    partes = [p for p in (AZURE_BLOB_PREFIX, subpasta) if p]
+    blob_name = "/".join(partes + [nome_arquivo]) if partes else nome_arquivo
 
     try:
         container_client = client.get_container_client(AZURE_CONTAINER)
@@ -348,7 +354,7 @@ def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> list
     final da ingestão inteira. Assim, mesmo que o script seja interrompido
     numa modalidade posterior, o Azure já tem tudo que foi concluído até ali.
     """
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(BRONZE_DIR, exist_ok=True)
 
     if modo == "overwrite" and os.path.exists(BRONZE_PATH):
         os.remove(BRONZE_PATH)
@@ -436,7 +442,7 @@ def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> list
         # modalidade termina, em vez de esperar a ingestão inteira acabar
         if not skip_upload and os.path.exists(BRONZE_PATH):
             print(f"    ↑ Subindo bronze para o Azure (checkpoint: fim de '{modalidade_nome}')...")
-            upload_para_blob(BRONZE_PATH, os.path.basename(BRONZE_PATH))
+            upload_para_blob(BRONZE_PATH, os.path.basename(BRONZE_PATH), subpasta="bronze")
 
     print("\n=== Diagnóstico por modalidade ===")
     for r in resumo_modalidades:
@@ -550,7 +556,7 @@ def transform_silver_contratacoes() -> pd.DataFrame:
 
     silver = silver.drop_duplicates(subset=["numero_controle_pncp"])
 
-    os.makedirs(DATA_DIR, exist_ok=True)
+    os.makedirs(SILVER_DIR, exist_ok=True)
     silver.to_csv(SILVER_PATH, index=False, encoding="utf-8-sig")
 
     print(f"✓ {len(silver):,} registros → {SILVER_PATH}")
@@ -593,7 +599,7 @@ def main():
 
     if not args.skip_upload:
         print("\n=== Upload silver → Azure Blob Storage ===")
-        upload_para_blob(SILVER_PATH, os.path.basename(SILVER_PATH))
+        upload_para_blob(SILVER_PATH, os.path.basename(SILVER_PATH), subpasta="silver")
 
     # resumo equivalente ao display() do notebook
     resumo = (

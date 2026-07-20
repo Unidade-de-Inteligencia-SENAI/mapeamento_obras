@@ -1,4 +1,4 @@
-# pncp_extract.py
+# pncp.py
 
 Script Python puro (sem Spark/Databricks) que extrai contratações de **obras**
 do Portal Nacional de Contratações Públicas (PNCP) para o estado de SP,
