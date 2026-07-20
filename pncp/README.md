@@ -1,6 +1,6 @@
-# pncp.py
+# pncp_extract.py
 
-Script Python puro (sem Spark/Databricks) que extrai contratações de **obras**
+Script em Python que extrai contratações de **obras**
 do Portal Nacional de Contratações Públicas (PNCP) para o estado de SP,
 transforma em uma tabela tratada e salva localmente em CSV — com upload
 opcional para o Azure Blob Storage.
@@ -22,7 +22,7 @@ opcional para o Azure Blob Storage.
    construção geral) via regex no objeto da compra, remove duplicados e
    salva em `data/silver_pncp_contratacoes_obras.csv`.
 
-3. **Upload para o Azure** — se o `.env` estiver configurado, o
+3. **Upload para o Azure (opcional)** — se o `.env` estiver configurado, o
    bronze é enviado para o Azure Blob Storage ao final de **cada modalidade**
    concluída (não só no fim do processo inteiro), e o silver é enviado ao
    final da transformação.
@@ -146,15 +146,23 @@ configurado. Bom para testar localmente.
 
 ```
 data/
-├── bronze_pncp_contratacoes.jsonl    # payload bruto da API, 1 JSON por linha
-├── checkpoint_pncp.json              # controle de janelas já concluídas (retomada)
-└── silver_pncp_contratacoes_obras.csv # tabela final tratada
+├── bronze/
+│   ├── bronze_pncp_contratacoes.jsonl    # payload bruto da API, 1 JSON por linha
+│   └── checkpoint_pncp.json              # controle de janelas já concluídas (retomada)
+└── silver/
+    └── silver_pncp_contratacoes_obras.csv # tabela final tratada
 ```
 
-Se o Azure estiver configurado, os mesmos `bronze_pncp_contratacoes.jsonl` e
-`silver_pncp_contratacoes_obras.csv` também aparecem no container definido
-em `AZURE_STORAGE_CONTAINER`, dentro do prefixo `AZURE_BLOB_PREFIX` (se
-informado).
+Se o Azure estiver configurado, a mesma separação é espelhada dentro do
+container, usando `AZURE_BLOB_PREFIX` como prefixo:
+
+```
+{container}/{AZURE_BLOB_PREFIX}/bronze/bronze_pncp_contratacoes.jsonl
+{container}/{AZURE_BLOB_PREFIX}/silver/silver_pncp_contratacoes_obras.csv
+```
+
+Ex: com `AZURE_STORAGE_CONTAINER=meucontainer` e `AZURE_BLOB_PREFIX=pncp`,
+o bronze fica em `meucontainer/pncp/bronze/bronze_pncp_contratacoes.jsonl`.
 
 ## Quando o upload para o Azure acontece
 
@@ -215,7 +223,6 @@ dado real ou sintoma de algo falhando.
 **Erro 429 (limite de requisições) com frequência**
 Aumente o `--delay` (ex: `--delay 3` ou mais) e rode de novo em modo
 `append` — o checkpoint evita retrabalho do que já deu certo.
-
 
 **Quero rodar em background com log salvo em arquivo**
 Use `python -u` para garantir saída sem buffer:
