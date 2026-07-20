@@ -568,7 +568,7 @@ def main():
     global DELAY_ENTRE_REQUESTS
 
     parser = argparse.ArgumentParser(description="Extração PNCP (obras) → CSV local")
-    parser.add_argument("--anos", nargs="+", type=int, default=[2022, 2023, 2024],
+    parser.add_argument("--anos", nargs="+", type=int, default=[2022, 2023, 2024,],
                          help="Anos a coletar, ex: --anos 2022 2023 2024")
     parser.add_argument("--modo", choices=["append", "overwrite"], default="append",
                          help="append: mantém bronze/checkpoint existentes | overwrite: recomeça do zero")
