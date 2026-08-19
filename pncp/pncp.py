@@ -4,17 +4,21 @@ pncp_extract.py
 Versão adaptada do notebook Databricks (bronze -> silver) para rodar como
 script Python puro em Linux, sem Spark/dbutils/Unity Catalog.
 
+Armazenamento: NÃO existe cópia local dos dados (bronze/silver). Tudo vive
+no Azure Blob Storage — bronze em JSONL (1 JSON por linha, igual ao payload
+bruto da API) e silver em Parquet — e é lido/escrito direto em memória
+(buffer em memória) — nada é gravado em disco além do checkpoint (controle
+de quais janelas já foram processadas, sem dado de negócio).
+
 Saídas:
   - local:
-      data/bronze/bronze_pncp_contratacoes.jsonl   (payload bruto, 1 JSON por linha)
-      data/bronze/checkpoint_pncp.json             (controle de retomada da ingestão)
-      data/silver/silver_pncp_contratacoes_obras.csv (tabela tratada, achatada)
-  - Azure Blob Storage (opcional, ver .env):
+      data/checkpoint_pncp.json                    (só controle de retomada)
+  - Azure Blob Storage — obrigatório para persistir qualquer dado real:
       {AZURE_STORAGE_CONTAINER}/{AZURE_BLOB_PREFIX}/bronze/bronze_pncp_contratacoes.jsonl
-      {AZURE_STORAGE_CONTAINER}/{AZURE_BLOB_PREFIX}/silver/silver_pncp_contratacoes_obras.csv
+      {AZURE_STORAGE_CONTAINER}/{AZURE_BLOB_PREFIX}/silver/silver_pncp_contratacoes_obras.parquet
 
 Dependências extras:
-  pip install python-dotenv azure-storage-blob
+  pip install python-dotenv azure-storage-blob pyarrow
 
 Configuração (.env na raiz do projeto — NUNCA commitar esse arquivo):
   # opção A (mais simples)
@@ -29,12 +33,18 @@ Configuração (.env na raiz do projeto — NUNCA commitar esse arquivo):
 Uso:
   python pncp_extract.py --anos 2022 2023 2024 --modo append
   python pncp_extract.py --anos 2024 --modo overwrite
-  python pncp_extract.py --anos 2024 --skip-upload   # só local, ignora o .env
+  python pncp_extract.py --anos 2024 --skip-upload   # só teste pontual — ver aviso sobre perda de dado
+
+ATENÇÃO: --skip-upload não é mais "modo local" de verdade — como não há
+cópia em disco, os dados coletados sem upload não ficam salvos em lugar
+nenhum (só o checkpoint sabe que a janela "já foi processada"). Use só
+para testes rápidos, nunca em execuções que você pretende manter.
 """
 
 import argparse
 import calendar
 import functools
+import io
 import json
 import os
 import re
@@ -74,12 +84,15 @@ load_dotenv(os.path.join(BASE_DIR, "..", ".env"))  # lê o .env da raiz do proje
 # ── Config ───────────────────────────────────────────────────────────────
 PNCP_BASE = "https://pncp.gov.br/api/consulta"
 DELAY_ENTRE_REQUESTS = 1.5  # segundos entre chamadas, para não estourar rate limit
+# Não existe mais cópia local de bronze/silver — os dados vivem só no Azure
+# (o "lake"). O único estado que persiste em disco é o checkpoint, que é
+# pequeno e não contém dado de negócio, só o controle de quais janelas já
+# foram processadas com sucesso.
 DATA_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "data"))  # .../data/
-BRONZE_DIR = os.path.join(DATA_DIR, "bronze")
-SILVER_DIR = os.path.join(DATA_DIR, "silver")
-BRONZE_PATH = os.path.join(BRONZE_DIR, "bronze_pncp_contratacoes.jsonl")
-SILVER_PATH = os.path.join(SILVER_DIR, "silver_pncp_contratacoes_obras.csv")
-CHECKPOINT_PATH = os.path.join(BRONZE_DIR, "checkpoint_pncp.json")  # fica junto do bronze — controla a ingestão
+CHECKPOINT_PATH = os.path.join(DATA_DIR, "checkpoint_pncp.json")
+
+NOME_BRONZE = "bronze_pncp_contratacoes.jsonl"
+NOME_SILVER = "silver_pncp_contratacoes_obras.parquet"
 
 # ── Config Azure Blob Storage (tudo vem do .env, nunca hardcoded) ─────────
 # Opção A (mais simples): AZURE_STORAGE_CONNECTION_STRING sozinha
@@ -124,7 +137,7 @@ def carregar_checkpoint() -> set:
 
 
 def salvar_checkpoint(chaves: set):
-    os.makedirs(BRONZE_DIR, exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(CHECKPOINT_PATH, "w", encoding="utf-8") as f:
         json.dump(sorted(chaves), f, ensure_ascii=False)
 
@@ -163,36 +176,127 @@ def get_blob_service_client():
         return None
 
 
-def upload_para_blob(local_path: str, nome_arquivo: str, subpasta: str = "") -> bool:
+def _blob_name(nome_arquivo: str, subpasta: str) -> str:
+    partes = [p for p in (AZURE_BLOB_PREFIX, subpasta) if p]
+    return "/".join(partes + [nome_arquivo]) if partes else nome_arquivo
+
+
+def baixar_jsonl_do_blob(nome_arquivo: str, subpasta: str) -> pd.DataFrame:
     """
-    Sobe local_path para {AZURE_CONTAINER}/{AZURE_BLOB_PREFIX}/{subpasta}/{nome_arquivo}.
-    Ex: subpasta="bronze" com AZURE_BLOB_PREFIX="pncp" → container/pncp/bronze/arquivo.jsonl
-    Sempre sobrescreve o blob (o arquivo local já reflete o estado atual,
-    seja modo append ou overwrite). Retorna True/False — nunca derruba o
-    pipeline principal se o upload falhar (o CSV/JSONL local já está salvo).
+    Baixa um blob JSONL (1 JSON por linha) direto para a memória e retorna
+    como DataFrame — nunca escreve nada em disco. Usado para o bronze, que
+    continua em JSON (o silver é que virou parquet). Se o blob não existir,
+    o Azure não estiver configurado, ou algo falhar, retorna um DataFrame
+    vazio (mesmo comportamento de "não havia dado prévio ainda").
+    """
+    client = get_blob_service_client()
+    if client is None:
+        return pd.DataFrame()
+
+    blob_name = _blob_name(nome_arquivo, subpasta)
+    try:
+        container_client = client.get_container_client(AZURE_CONTAINER)
+        blob_client = container_client.get_blob_client(blob_name)
+        if not blob_client.exists():
+            print(f"    ℹ️  Nenhum bronze prévio em '{blob_name}' — começando do zero")
+            return pd.DataFrame()
+
+        conteudo = blob_client.download_blob().readall().decode("utf-8")
+        registros = [json.loads(linha) for linha in conteudo.splitlines() if linha.strip()]
+        df = pd.DataFrame(registros)
+        print(f"    ✓ Baixado '{blob_name}' da memória — {len(df):,} registro(s) prévio(s)")
+        return df
+    except Exception as e:
+        print(f"    ❌ Falha ao baixar '{blob_name}' do Azure: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+
+
+def upload_dataframe_jsonl(df: pd.DataFrame, nome_arquivo: str, subpasta: str = "") -> bool:
+    """
+    Serializa df como JSONL (1 JSON por linha, igual ao bronze original) num
+    buffer em memória e sobe para {AZURE_CONTAINER}/{AZURE_BLOB_PREFIX}/{subpasta}/{nome_arquivo}.
+    Nunca grava nada em disco local. Sempre sobrescreve o blob. Retorna
+    True/False — nunca derruba o pipeline principal se o upload falhar.
     """
     client = get_blob_service_client()
     if client is None:
         return False
 
-    if not os.path.exists(local_path):
-        print(f"    ⚠️  Arquivo local não encontrado para upload: {local_path}")
-        return False
-
-    partes = [p for p in (AZURE_BLOB_PREFIX, subpasta) if p]
-    blob_name = "/".join(partes + [nome_arquivo]) if partes else nome_arquivo
-
+    blob_name = _blob_name(nome_arquivo, subpasta)
     try:
+        linhas = "\n".join(json.dumps(reg, ensure_ascii=False) for reg in df.to_dict("records"))
+        dados = linhas.encode("utf-8")
+        tamanho_mb = len(dados) / (1024 * 1024)
+
         container_client = client.get_container_client(AZURE_CONTAINER)
         if not container_client.exists():
             container_client.create_container()
             print(f"    ✓ Container '{AZURE_CONTAINER}' criado no Azure")
 
-        with open(local_path, "rb") as f:
-            container_client.upload_blob(name=blob_name, data=f, overwrite=True)
+        container_client.upload_blob(name=blob_name, data=dados, overwrite=True)
+        print(f"    ✓ Upload OK → container '{AZURE_CONTAINER}' / blob '{blob_name}' "
+              f"({len(df):,} registros, {tamanho_mb:.2f} MB)")
+        return True
+    except Exception as e:
+        print(f"    ❌ Falha no upload para o Azure ({nome_arquivo}): {type(e).__name__}: {e}")
+        return False
 
-        tamanho_mb = os.path.getsize(local_path) / (1024 * 1024)
-        print(f"    ✓ Upload OK → container '{AZURE_CONTAINER}' / blob '{blob_name}' ({tamanho_mb:.2f} MB)")
+
+def baixar_parquet_do_blob(nome_arquivo: str, subpasta: str) -> pd.DataFrame:
+    """
+    Baixa um blob parquet direto para a memória (BytesIO) e retorna como
+    DataFrame — nunca escreve nada em disco. Usado só para o silver. Se o
+    blob não existir, o Azure não estiver configurado, ou algo falhar,
+    retorna um DataFrame vazio.
+    """
+    client = get_blob_service_client()
+    if client is None:
+        return pd.DataFrame()
+
+    blob_name = _blob_name(nome_arquivo, subpasta)
+    try:
+        container_client = client.get_container_client(AZURE_CONTAINER)
+        blob_client = container_client.get_blob_client(blob_name)
+        if not blob_client.exists():
+            print(f"    ℹ️  Nenhum parquet prévio em '{blob_name}' — começando do zero")
+            return pd.DataFrame()
+
+        buffer = io.BytesIO(blob_client.download_blob().readall())
+        df = pd.read_parquet(buffer)
+        print(f"    ✓ Baixado '{blob_name}' da memória — {len(df):,} registro(s) prévio(s)")
+        return df
+    except Exception as e:
+        print(f"    ❌ Falha ao baixar '{blob_name}' do Azure: {type(e).__name__}: {e}")
+        return pd.DataFrame()
+
+
+def upload_dataframe_parquet(df: pd.DataFrame, nome_arquivo: str, subpasta: str = "") -> bool:
+    """
+    Serializa df como parquet num buffer em memória (BytesIO) e sobe para
+    {AZURE_CONTAINER}/{AZURE_BLOB_PREFIX}/{subpasta}/{nome_arquivo}. Usado só
+    para o silver. Nunca grava nada em disco local. Sempre sobrescreve o
+    blob. Retorna True/False — nunca derruba o pipeline principal se o
+    upload falhar.
+    """
+    client = get_blob_service_client()
+    if client is None:
+        return False
+
+    blob_name = _blob_name(nome_arquivo, subpasta)
+    try:
+        buffer = io.BytesIO()
+        df.to_parquet(buffer, index=False, engine="pyarrow")
+        tamanho_mb = buffer.tell() / (1024 * 1024)
+        buffer.seek(0)
+
+        container_client = client.get_container_client(AZURE_CONTAINER)
+        if not container_client.exists():
+            container_client.create_container()
+            print(f"    ✓ Container '{AZURE_CONTAINER}' criado no Azure")
+
+        container_client.upload_blob(name=blob_name, data=buffer, overwrite=True)
+        print(f"    ✓ Upload OK → container '{AZURE_CONTAINER}' / blob '{blob_name}' "
+              f"({len(df):,} registros, {tamanho_mb:.2f} MB)")
         return True
     except Exception as e:
         print(f"    ❌ Falha no upload para o Azure ({nome_arquivo}): {type(e).__name__}: {e}")
@@ -261,6 +365,7 @@ def fetch_janela(modalidade_id: int, modalidade_nome: str,
     while True:
         resp = None
         tentativas_429 = 0
+        tentativas_conexao = 0
         while True:  # loop de tentativas para essa página (timeout/conexão/429)
             print(f"    … buscando {data_inicial[:6]} mod={modalidade_id} pág={pagina}", end="\r")
             try:
@@ -278,10 +383,18 @@ def fetch_janela(modalidade_id: int, modalidade_nome: str,
                 )
             except (requests.exceptions.Timeout,
                     requests.exceptions.ConnectionError) as e:
-                msg = f"conexão falhou (pág={pagina}): {type(e).__name__}"
-                eventos.append(msg)
-                print(f"    ❌ {data_inicial[:6]} mod={modalidade_id} pág={pagina} — desistindo ({msg})")
-                return {"obras": resultado, "total_avaliado": total_avaliado, "eventos": eventos}
+                tentativas_conexao += 1
+                if tentativas_conexao > 4:
+                    msg = f"conexão falhou (pág={pagina}) após 4 tentativas: {type(e).__name__}"
+                    eventos.append(msg)
+                    print(f"    ❌ {data_inicial[:6]} mod={modalidade_id} pág={pagina} — desistindo ({msg})")
+                    return {"obras": resultado, "total_avaliado": total_avaliado, "eventos": eventos}
+                espera = 5 * tentativas_conexao  # 5s, 10s, 15s, 20s
+                print(f"    ⏳ {data_inicial[:6]} mod={modalidade_id} pág={pagina} — {type(e).__name__}, "
+                      f"aguardando {espera}s (tentativa {tentativas_conexao}/4)")
+                sleep(espera)
+                session = criar_session()  # sessão nova, evita reaproveitar conexão TCP quebrada
+                continue  # tenta a mesma página de novo
 
             if resp.status_code == 429:
                 tentativas_429 += 1
@@ -343,26 +456,48 @@ def fetch_janela(modalidade_id: int, modalidade_nome: str,
 
 
 # ── Ingestão bronze ──────────────────────────────────────────────────────
-def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> list:
+def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> pd.DataFrame:
     """
     modo:
-      - 'overwrite': apaga o bronze existente e recomeça do zero
-      - 'append'   : mantém o bronze existente e adiciona os novos registros
+      - 'overwrite': ignora qualquer bronze existente no Azure e recomeça
+                     do zero (e limpa o checkpoint local também)
+      - 'append'   : baixa o bronze existente do Azure (para a memória, sem
+                     gravar em disco), mantém o checkpoint local, e só busca
+                     as janelas que ainda faltam
 
     skip_upload: se False (padrão), sobe o bronze acumulado para o Azure ao
     final de CADA modalidade (ex: ao terminar Pregão Eletrônico), não só no
     final da ingestão inteira. Assim, mesmo que o script seja interrompido
     numa modalidade posterior, o Azure já tem tudo que foi concluído até ali.
-    """
-    os.makedirs(BRONZE_DIR, exist_ok=True)
 
-    if modo == "overwrite" and os.path.exists(BRONZE_PATH):
-        os.remove(BRONZE_PATH)
+    GARANTIA: uma janela só entra no checkpoint DEPOIS que o upload do lote
+    correspondente é confirmado no Azure — nunca antes. Isso significa que
+    "está no checkpoint" sempre implica "o dado está salvo no Azure",
+    mesmo que o processo seja interrompido no meio de uma modalidade. Rodar
+    com --skip-upload (ou sem o Azure configurado) faz o checkpoint nunca
+    avançar — nada fica marcado como concluído, então tudo é refeito na
+    próxima execução. Correto, mas menos eficiente; use só para testes.
+
+    Retorna o DataFrame bronze completo (prévio + coletado nesta execução).
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+
     if modo == "overwrite" and os.path.exists(CHECKPOINT_PATH):
         os.remove(CHECKPOINT_PATH)
 
     checkpoint = carregar_checkpoint()
     print(f"Checkpoint: {len(checkpoint):,} janela(s) já concluída(s) em execuções anteriores (serão puladas)")
+
+    if skip_upload:
+        print("    ℹ️  --skip-upload ativo: nada será enviado ao Azure, então o checkpoint não vai avançar "
+              "nesta execução (nenhuma janela nova entra como concluída). É seguro, só menos eficiente — "
+              "tudo que for buscado agora será refeito na próxima execução real.")
+
+    if modo == "overwrite" or not _azure_configurado():
+        bronze_df = pd.DataFrame()
+    else:
+        print("\n=== Baixando bronze existente do Azure (memória, sem disco) ===")
+        bronze_df = baixar_jsonl_do_blob(NOME_BRONZE, "bronze")
 
     registros = []
     resumo_modalidades = []
@@ -384,6 +519,13 @@ def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> list
         total_obras_mod = 0
         eventos_mod = []
         janelas_com_falha = 0
+        # Chaves de janela concluídas com sucesso NESTA modalidade, ainda não
+        # confirmadas no checkpoint — só entram no checkpoint de verdade
+        # depois que o upload deste lote for bem-sucedido. Isso garante o
+        # invariante "toda chave no checkpoint tem o dado correspondente
+        # realmente salvo no Azure" — mesmo que o processo seja interrompido
+        # no meio da modalidade.
+        checkpoint_pendente = set()
 
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
@@ -401,19 +543,12 @@ def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> list
                         janelas_com_falha += 1
                         eventos_mod.extend(f"{di[:6]}: {ev}" for ev in res["eventos"])
                     else:
-                        # só marca como concluída no checkpoint se não houve nenhum evento
-                        # de erro — assim ela é reprocessada automaticamente na próxima vez
+                        # bem-sucedida, mas só vira checkpoint de verdade após o upload
                         with _lock:
-                            checkpoint.add(_janela_key(modalidade_id, di, df_))
-                            salvar_checkpoint(checkpoint)
+                            checkpoint_pendente.add(_janela_key(modalidade_id, di, df_))
                     if lote:
                         with _lock:
-                            registros.extend(lote)
-                            # grava incrementalmente no bronze (jsonl) — evita perder
-                            # progresso em caso de queda no meio da execução
-                            with open(BRONZE_PATH, "a", encoding="utf-8") as f:
-                                for reg in lote:
-                                    f.write(json.dumps(reg, ensure_ascii=False) + "\n")
+                            registros.extend(lote)  # fica só em memória, nunca em disco
                         print(f"    ✓ {di[:6]} — {len(lote)} obras (de {res['total_avaliado']} contratos avaliados)")
                 except Exception as e:
                     janelas_com_falha += 1
@@ -438,11 +573,35 @@ def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> list
             if len(eventos_mod) > 10:
                 print(f"       ... e mais {len(eventos_mod) - 10}")
 
-        # upload incremental: sobe o bronze acumulado até aqui assim que essa
-        # modalidade termina, em vez de esperar a ingestão inteira acabar
-        if not skip_upload and os.path.exists(BRONZE_PATH):
+        # upload incremental: sobe o bronze acumulado (prévio + novo) assim que
+        # essa modalidade termina, em vez de esperar a ingestão inteira acabar.
+        # Mescla em memória — nunca grava nada em disco.
+        if registros:
+            combinado = pd.concat([bronze_df, pd.DataFrame(registros)], ignore_index=True) if not bronze_df.empty else pd.DataFrame(registros)
+        else:
+            combinado = bronze_df
+
+        if skip_upload:
+            if checkpoint_pendente:
+                print(f"    ⚠️  --skip-upload ativo: {len(checkpoint_pendente)} janela(s) de "
+                      f"'{modalidade_nome}' NÃO entram no checkpoint (dado não foi persistido em "
+                      f"lugar nenhum) — serão refeitas na próxima execução.")
+        elif not checkpoint_pendente:
+            # nada novo foi coletado nesta modalidade (tudo já estava no checkpoint) —
+            # não faz sentido re-subir o mesmo bronze que já está no Azure
+            print(f"    ↷ Nada novo em '{modalidade_nome}' — upload pulado (bronze no Azure já está atualizado)")
+        elif not combinado.empty:
             print(f"    ↑ Subindo bronze para o Azure (checkpoint: fim de '{modalidade_nome}')...")
-            upload_para_blob(BRONZE_PATH, os.path.basename(BRONZE_PATH), subpasta="bronze")
+            sucesso = upload_dataframe_jsonl(combinado, NOME_BRONZE, subpasta="bronze")
+            if sucesso:
+                # só agora essas janelas viram checkpoint de verdade — o dado
+                # delas está confirmado no Azure
+                with _lock:
+                    checkpoint.update(checkpoint_pendente)
+                    salvar_checkpoint(checkpoint)
+            elif checkpoint_pendente:
+                print(f"    ⚠️  Upload falhou — {len(checkpoint_pendente)} janela(s) de "
+                      f"'{modalidade_nome}' NÃO entram no checkpoint e serão refeitas na próxima execução.")
 
     print("\n=== Diagnóstico por modalidade ===")
     for r in resumo_modalidades:
@@ -451,7 +610,9 @@ def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> list
               f"com_evento={r['janelas_com_evento']:>3}  "
               f"contratos_avaliados={r['contratos_avaliados']:>6}  "
               f"obras_encontradas={r['obras_encontradas']:>4}")
-        if r["contratos_avaliados"] == 0 and r["janelas_com_evento"] == 0:
+        if r["janelas"] == 0:
+            pass  # tudo já estava no checkpoint — nada foi de fato consultado nesta execução
+        elif r["contratos_avaliados"] == 0 and r["janelas_com_evento"] == 0:
             print(f"    ⚠️  Nenhum contrato foi avaliado e nenhum evento foi registrado — "
                   f"a API pode estar retornando 204 (sem conteúdo) genuinamente para essa "
                   f"modalidade/período, mas vale checar manualmente 1 janela no navegador.")
@@ -460,10 +621,12 @@ def ingest_pncp_bronze(anos: list, modo: str, skip_upload: bool = False) -> list
                   f"forte indício de que as chamadas para essa modalidade estão falhando "
                   f"(ver eventos acima), não que não existem obras.")
 
-    print(f"\nTotal coletado nesta execução: {len(registros):,} registros")
-    print(f"✓ Bronze salvo em → {BRONZE_PATH}")
-    return registros
-
+    bronze_final = pd.concat([bronze_df, pd.DataFrame(registros)], ignore_index=True) if registros and not bronze_df.empty else (
+        pd.DataFrame(registros) if registros else bronze_df
+    )
+    print(f"\nTotal coletado nesta execução: {len(registros):,} registros novos "
+          f"(total acumulado: {len(bronze_final):,})")
+    return bronze_final
 
 # ── Transformação silver ─────────────────────────────────────────────────
 def _classificar_tipo_obra(objeto: str) -> str:
@@ -483,23 +646,23 @@ def _classificar_tipo_obra(objeto: str) -> str:
     return "construção geral"
 
 
-def transform_silver_contratacoes() -> pd.DataFrame:
+def transform_silver_contratacoes(bronze_df: pd.DataFrame = None, skip_upload: bool = False) -> pd.DataFrame:
     """
-    Lê o bronze (jsonl com payload bruto), achata o JSON aninhado e produz
-    a tabela silver equivalente à do notebook original.
+    Achata o JSON aninhado do bronze e produz a tabela silver equivalente à
+    do notebook original. Se bronze_df não for passado (ex: quando chamado
+    com --skip-ingest), baixa o bronze do Azure para a memória. Nunca lê
+    nem grava nada em disco — o parquet final é enviado direto do buffer.
     """
-    if not os.path.exists(BRONZE_PATH):
-        raise FileNotFoundError(f"Bronze não encontrado em {BRONZE_PATH}. Rode a ingestão primeiro.")
+    if bronze_df is None:
+        print("\n=== Baixando bronze do Azure (memória, sem disco) ===")
+        bronze_df = baixar_jsonl_do_blob(NOME_BRONZE, "bronze")
 
-    linhas_bronze = []
-    with open(BRONZE_PATH, "r", encoding="utf-8") as f:
-        for linha in f:
-            linha = linha.strip()
-            if linha:
-                linhas_bronze.append(json.loads(linha))
+    if bronze_df.empty:
+        raise ValueError("Bronze está vazio (nem em memória, nem no Azure). Rode a ingestão primeiro "
+                          "(sem --skip-ingest) ou confira se o .env do Azure está configurado corretamente.")
 
     registros = []
-    for linha in linhas_bronze:
+    for linha in bronze_df.to_dict("records"):
         d = json.loads(linha["payload"])
         orgao = d.get("orgaoEntidade") or {}
         unidade = d.get("unidadeOrgao") or {}
@@ -556,10 +719,11 @@ def transform_silver_contratacoes() -> pd.DataFrame:
 
     silver = silver.drop_duplicates(subset=["numero_controle_pncp"])
 
-    os.makedirs(SILVER_DIR, exist_ok=True)
-    silver.to_csv(SILVER_PATH, index=False, encoding="utf-8-sig")
+    print(f"✓ {len(silver):,} registros silver gerados em memória")
 
-    print(f"✓ {len(silver):,} registros → {SILVER_PATH}")
+    if not skip_upload:
+        upload_dataframe_parquet(silver, NOME_SILVER, subpasta="silver")
+
     return silver
 
 
@@ -567,18 +731,21 @@ def transform_silver_contratacoes() -> pd.DataFrame:
 def main():
     global DELAY_ENTRE_REQUESTS
 
-    parser = argparse.ArgumentParser(description="Extração PNCP (obras) → CSV local")
-    parser.add_argument("--anos", nargs="+", type=int, default=[2022, 2023, 2024,],
+    parser = argparse.ArgumentParser(description="Extração PNCP (obras) → parquet no Azure (lake)")
+    parser.add_argument("--anos", nargs="+", type=int, default=[2022, 2023, 2024],
                          help="Anos a coletar, ex: --anos 2022 2023 2024")
     parser.add_argument("--modo", choices=["append", "overwrite"], default="append",
-                         help="append: mantém bronze/checkpoint existentes | overwrite: recomeça do zero")
+                         help="append: mescla com o bronze/silver existentes no Azure | overwrite: recomeça do zero")
     parser.add_argument("--skip-ingest", action="store_true",
-                         help="Pula a ingestão e só reprocessa o bronze existente para silver")
+                         help="Pula a ingestão e só reprocessa o bronze existente (baixado do Azure) para silver")
     parser.add_argument("--delay", type=float, default=DELAY_ENTRE_REQUESTS,
                          help=f"Segundos de espera entre chamadas à API (padrão: {DELAY_ENTRE_REQUESTS}). "
                               f"Aumente se continuar tomando 429.")
     parser.add_argument("--skip-upload", action="store_true",
-                         help="Não sobe bronze/silver para o Azure Blob Storage, mesmo se o .env estiver configurado")
+                         help="Não sobe bronze/silver para o Azure Blob Storage. ATENÇÃO: como não há mais "
+                              "cópia local dos dados, usar esta flag junto com --modo append pode fazer o "
+                              "checkpoint marcar janelas como concluídas sem que o dado fique salvo em "
+                              "lugar nenhum — use só para testes pontuais.")
     args = parser.parse_args()
 
     DELAY_ENTRE_REQUESTS = args.delay
@@ -588,18 +755,15 @@ def main():
     print(f"Delay: {DELAY_ENTRE_REQUESTS}s entre chamadas")
     print(f"Upload Azure: {'desabilitado (--skip-upload)' if args.skip_upload else ('configurado' if _azure_configurado() else 'sem credenciais no .env')}")
 
+    bronze_df = None
     if not args.skip_ingest:
         print("=== Bronze PNCP ===")
-        ingest_pncp_bronze(args.anos, args.modo, skip_upload=args.skip_upload)
+        bronze_df = ingest_pncp_bronze(args.anos, args.modo, skip_upload=args.skip_upload)
         # upload do bronze já acontece dentro de ingest_pncp_bronze, ao final
         # de cada modalidade — não precisa subir de novo aqui.
 
     print("\n=== Silver PNCP (obras) ===")
-    silver = transform_silver_contratacoes()
-
-    if not args.skip_upload:
-        print("\n=== Upload silver → Azure Blob Storage ===")
-        upload_para_blob(SILVER_PATH, os.path.basename(SILVER_PATH), subpasta="silver")
+    silver = transform_silver_contratacoes(bronze_df=bronze_df, skip_upload=args.skip_upload)
 
     # resumo equivalente ao display() do notebook
     resumo = (
@@ -617,8 +781,10 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⏹️  Interrompido manualmente (Ctrl+C). O progresso já salvo no bronze/checkpoint "
-              "não foi perdido — rode de novo em modo append para continuar de onde parou.")
+        print("\n\n⏹️  Interrompido manualmente (Ctrl+C). O checkpoint local só marca uma janela como "
+              "concluída DEPOIS que o upload daquele lote é confirmado no Azure — então nenhum dado "
+              "'sumido' vai aparecer como já processado. O que não deu tempo de subir simplesmente não "
+              "entrou no checkpoint e será refeito automaticamente na próxima execução em --modo append.")
     except Exception:
         print("\n\n💥 O script encerrou por causa de um erro não previsto:")
         traceback.print_exc()

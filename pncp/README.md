@@ -1,9 +1,8 @@
-# pncp_extract.py
+# pncp.py
 
-Script em Python que extrai contratações de **obras**
+Script Python puro que extrai contratações de **obras**
 do Portal Nacional de Contratações Públicas (PNCP) para o estado de SP,
-transforma em uma tabela tratada e salva localmente em CSV — com upload
-opcional para o Azure Blob Storage.
+transforma em uma tabela tratada e salva tudo no **Azure Blob Storage**. Não existe cópia local dos dados — só um arquivo de checkpoint pequeno, usado para retomar execuções interrompidas.
 
 ## O que ele faz
 
@@ -13,19 +12,28 @@ opcional para o Azure Blob Storage.
    data (mensais ou semanais, dependendo do volume da modalidade) para os
    anos pedidos. Filtra apenas contratos cujo objeto contenha palavras
    relacionadas a obras (`obra`, `construção`, `paviment`, `reforma`,
-   `saneamento`, `drenagem`, `ponte`, `habitação` etc.) e salva o payload
-   bruto em `data/bronze_pncp_contratacoes.jsonl` (um JSON por linha).
+   `saneamento`, `drenagem`, `ponte`, `habitação` etc.) e mantém o payload
+   bruto **em memória**, em formato JSONL (1 JSON por linha).
 
-2. **Silver** — lê o bronze, achata os campos aninhados (órgão, unidade,
-   amparo legal), classifica cada contrato num `tipo_obra` (pavimentação,
-   saneamento, viário, habitação, drenagem, equipamento social/esportivo,
-   construção geral) via regex no objeto da compra, remove duplicados e
-   salva em `data/silver_pncp_contratacoes_obras.csv`.
+2. **Silver** — a partir do bronze (baixado do Azure ou já em memória),
+   achata os campos aninhados (órgão, unidade, amparo legal), classifica
+   cada contrato num `tipo_obra` (pavimentação, saneamento, viário,
+   habitação, drenagem, equipamento social/esportivo, construção geral) via
+   regex no objeto da compra, remove duplicados e serializa como **Parquet**.
 
-3. **Upload para o Azure (opcional)** — se o `.env` estiver configurado, o
-   bronze é enviado para o Azure Blob Storage ao final de **cada modalidade**
-   concluída (não só no fim do processo inteiro), e o silver é enviado ao
-   final da transformação.
+3. **Upload para o Azure** — bronze e silver são enviados direto de um
+   buffer em memória (nunca passam pelo disco). O bronze sobe ao final de
+   **cada modalidade** concluída (não só no fim do processo inteiro); o
+   silver sobe uma vez, ao final da transformação.
+
+**Garantia importante:** uma janela só entra no checkpoint **depois** que o
+upload do lote correspondente é confirmado no Azure — nunca antes. Isso
+significa que "está no checkpoint" sempre implica "o dado está salvo no
+Azure", mesmo que o processo seja interrompido no meio de uma modalidade.
+Se o upload falhar ou o script for interrompido antes dele, aquelas janelas
+simplesmente não entram no checkpoint e são refeitas automaticamente na
+próxima execução — nunca ficam num estado "marcado como feito, mas sem
+dado".
 
 ## Pré-requisitos
 
@@ -36,22 +44,21 @@ opcional para o Azure Blob Storage.
 pip install -r requirements.txt
 ```
 
-Isso instala `requests`, `pandas`, `python-dotenv` e `azure-storage-blob`.
-Se você não vai usar o upload para o Azure, pode pular a instalação do
-`azure-storage-blob` — o script detecta que o pacote não está presente e
-simplesmente pula essa etapa com um aviso, sem quebrar.
+Isso instala `requests`, `pandas`, `pyarrow` (necessário para ler/escrever
+o silver em Parquet), `python-dotenv` e `azure-storage-blob`.
 
-## Configuração do Azure (opcional)
+## Configuração do Azure
 
-1. Copie `.env.example` para `.env`:
+1. Copie `.env.example` para `.env`, na **raiz do projeto** (um nível acima
+   da pasta onde `pncp.py` está — o script já sabe procurar lá,
+   independente de onde você rodar o comando):
 
 ```bash
 cp .env.example .env
 ```
 
-2. Preencha o `.env` com as credenciais da Storage Account (veja a seção
-   "Onde encontrar as credenciais do Azure" abaixo). Só é preciso preencher
-   **uma** das duas opções:
+2. Preencha o `.env`. Só é preciso preencher **uma** das duas opções de
+   credencial:
 
 ```ini
 # Opção A — mais simples
@@ -66,8 +73,8 @@ AZURE_STORAGE_CONTAINER=pncp
 AZURE_BLOB_PREFIX=obras/sp
 ```
 
-Se o `.env` não existir ou estiver vazio, o script roda normalmente e só
-salva localmente — o upload é pulado com um aviso no console.
+3. **Nunca commite o `.env`.** Garanta que ele está no `.gitignore` do
+   repositório antes do primeiro commit.
 
 ### Onde encontrar as credenciais do Azure
 
@@ -87,6 +94,14 @@ Azure rodar:
 az storage account show-connection-string --name NOME_DA_CONTA --resource-group NOME_DO_RESOURCE_GROUP
 ```
 
+Para conferir que os arquivos realmente estão lá (mais confiável que
+navegar pelo portal, que às vezes fica com cache desatualizado):
+
+```bash
+az storage blob list --account-name SUA_CONTA --container-name SEU_CONTAINER --prefix bronze/ --output table
+az storage blob list --account-name SUA_CONTA --container-name SEU_CONTAINER --prefix silver/ --output table
+```
+
 > As Access Keys dão acesso total à conta de armazenamento. Se precisar de
 > um acesso mais restrito (só a um container específico), use um SAS token
 > no lugar — isso exigiria um pequeno ajuste no script.
@@ -96,94 +111,103 @@ az storage account show-connection-string --name NOME_DA_CONTA --resource-group 
 ### Primeira execução (do zero)
 
 ```bash
-python pncp_extract.py --anos 2022 2023 2024 --modo overwrite
+python pncp.py --anos 2022 2023 2024 --modo overwrite
 ```
 
-Isso apaga qualquer bronze/checkpoint local existente e começa a coleta do
-zero para os anos informados.
+Ignora qualquer bronze existente no Azure e limpa o checkpoint local,
+começando a coleta do zero para os anos informados.
 
 ### Execuções seguintes / retomar após interrupção
 
 ```bash
-python pncp_extract.py --anos 2022 2023 2024 --modo append
+python pncp.py --anos 2022 2023 2024 --modo append
 ```
 
-Em modo `append`, o script consulta o **checkpoint** (`data/checkpoint_pncp.json`)
-e pula automaticamente as janelas (modalidade + período) que já foram
-concluídas com sucesso em execuções anteriores — então interromper o
-processo (Ctrl+C, queda de conexão, rate limit persistente) não faz perder
-o progresso. É esse o modo recomendado no dia a dia.
+Em modo `append`, o script:
+1. Baixa o bronze existente do Azure para a memória (sem gravar em disco).
+2. Consulta o checkpoint local e pula automaticamente as janelas
+   (modalidade + período) já concluídas.
+3. Mescla o que coletar de novo com o que já existia, em memória.
+4. Sobe o resultado combinado ao final de cada modalidade.
+
+Interromper o processo (Ctrl+C, queda de conexão, rate limit persistente)
+não corrompe nada — o que já tinha sido confirmado no Azure continua lá, e
+o que não deu tempo de subir simplesmente é refeito na próxima execução.
+Este é o modo recomendado no dia a dia.
+
+**Nota sobre publicação retroativa:** o checkpoint marca uma janela como
+concluída na primeira consulta sem erro. Se o PNCP receber uma publicação
+tardia com data de referência dentro de um período já checkpointado, esse
+dado novo não vai ser recapturado automaticamente — não existe hoje uma
+janela de segurança/reprocessamento automático dos últimos meses.
 
 ### Só reprocessar o silver, sem consultar a API de novo
 
-Útil se você mudou a lógica de classificação de `tipo_obra` e quer só
-regerar o CSV a partir do bronze que já existe:
+Útil se você mudou a lógica de classificação de `tipo_obra` (ou qualquer
+outra parte da transformação) e quer só regerar o Parquet a partir do
+bronze que já existe no Azure — zero chamadas à API do PNCP:
 
 ```bash
-python pncp_extract.py --skip-ingest
+python pncp.py --skip-ingest
 ```
-
-### Rodar sem subir para o Azure
-
-```bash
-python pncp_extract.py --anos 2024 --skip-upload
-```
-
-Roda tudo normalmente, mas nunca toca no Azure — nem se o `.env` estiver
-configurado. Bom para testar localmente.
 
 ### Todos os parâmetros
 
 | Flag | Padrão | Descrição |
 |---|---|---|
 | `--anos` | `2022 2023 2024` | Anos a coletar. Ex: `--anos 2023 2024` |
-| `--modo` | `append` | `append` mantém bronze/checkpoint existentes; `overwrite` apaga tudo e recomeça |
-| `--skip-ingest` | desligado | Pula a consulta à API e só regenera o silver a partir do bronze existente |
+| `--modo` | `append` | `append` mescla com bronze/silver já existentes no Azure; `overwrite` ignora tudo e recomeça do zero (limpa o checkpoint também) |
+| `--skip-ingest` | desligado | Pula a consulta à API e só regenera o silver a partir do bronze existente no Azure |
 | `--delay` | `1.5` | Segundos de espera entre chamadas à API do PNCP. Aumente (ex: `--delay 3`) se estiver tomando erro 429 (limite de requisições) com frequência |
-| `--skip-upload` | desligado | Não sobe nada para o Azure, mesmo com `.env` configurado |
+| `--skip-upload` | desligado | Não sobe nada para o Azure. O checkpoint não avança nesta execução — use só para testes |
 
-## Arquivos gerados
+## Onde as coisas ficam
 
 ```
 data/
-├── bronze/
-│   ├── bronze_pncp_contratacoes.jsonl    # payload bruto da API, 1 JSON por linha
-│   └── checkpoint_pncp.json              # controle de janelas já concluídas (retomada)
-└── silver/
-    └── silver_pncp_contratacoes_obras.csv # tabela final tratada
+└── checkpoint_pncp.json    # único arquivo local — controle de retomada, sem dado de negócio
 ```
 
-Se o Azure estiver configurado, a mesma separação é espelhada dentro do
-container, usando `AZURE_BLOB_PREFIX` como prefixo:
+No Azure, dentro do container definido em `AZURE_STORAGE_CONTAINER`,
+usando `AZURE_BLOB_PREFIX` como prefixo:
 
 ```
 {container}/{AZURE_BLOB_PREFIX}/bronze/bronze_pncp_contratacoes.jsonl
-{container}/{AZURE_BLOB_PREFIX}/silver/silver_pncp_contratacoes_obras.csv
+{container}/{AZURE_BLOB_PREFIX}/silver/silver_pncp_contratacoes_obras.parquet
 ```
 
 Ex: com `AZURE_STORAGE_CONTAINER=meucontainer` e `AZURE_BLOB_PREFIX=pncp`,
-o bronze fica em `meucontainer/pncp/bronze/bronze_pncp_contratacoes.jsonl`.
+o bronze fica em `meucontainer/pncp/bronze/bronze_pncp_contratacoes.jsonl`
+e o silver em `meucontainer/pncp/silver/silver_pncp_contratacoes_obras.parquet`.
 
 ## Quando o upload para o Azure acontece
 
-O upload **não** espera o processo inteiro terminar:
-
 ```
+carrega checkpoint local
+baixa bronze existente do Azure (memória, sem disco) — se modo=append
 para cada modalidade (Concorrência Eletrônica, Presencial, Pregão, Dispensa):
-    processa todas as janelas dessa modalidade
-      └─ a cada janela: grava bronze local + checkpoint local
-    [modalidade concluída]
-      └─ sobe o bronze acumulado até aqui para o Azure
+    para cada janela ainda não concluída:
+        ✓ sucesso → fica em memória (checkpoint local só é gravado depois do upload)
+    [modalidade termina]
+        → se coletou algo novo nesta modalidade: sobe o bronze combinado pro Azure
+          → só em caso de sucesso, o checkpoint é atualizado no disco
+        → se não coletou nada novo (tudo já estava no checkpoint): upload é pulado
 
-[todas as modalidades concluídas]
-gera o silver local
-    └─ sobe o silver para o Azure
+[as 4 modalidades terminaram]
+    → lê o bronze inteiro (memória), reprocessa tudo, sobe o silver pro Azure
 ```
 
-Ou seja, se o script for interrompido no meio de uma modalidade longa (o
-Pregão Eletrônico, com ~159 janelas, é a mais demorada), o Azure já tem tudo
-que foi concluído nas modalidades anteriores — só a modalidade em andamento
-no momento da interrupção é que ainda não subiu.
+Pontos importantes:
+- O upload do bronze **não** espera o processo inteiro terminar — acontece
+  a cada modalidade concluída, então interromper no meio do Pregão
+  Eletrônico (a modalidade mais longa, ~159 janelas) não faz perder o que
+  já tinha sido processado nas modalidades anteriores.
+- Se uma modalidade não tinha nenhuma janela nova para processar (tudo já
+  no checkpoint), o script **não** reenvia o bronze — evita upload
+  redundante quando não há nada de novo.
+- O silver **sempre** reprocessa o bronze inteiro do zero a cada execução
+  (não é incremental) e só é gerado/enviado depois que a ingestão inteira
+  terminar — não existe upload parcial do silver.
 
 ## Entendendo o log durante a execução
 
@@ -198,20 +222,34 @@ no momento da interrupção é que ainda não subiu.
   reportado, é sinal de que a API genuinamente não tinha nada para aquele
   período/modalidade (não é bug)
 
-Eventos de erro aparecem assim:
+Quando uma modalidade não tem nada novo a processar (tudo já no
+checkpoint), aparece:
+
+```
+  → Concorrência Eletrônica | 0 janelas a processar (12 já concluídas via checkpoint) | 1 worker(s)
+    ↷ Nada novo em 'Concorrência Eletrônica' — upload pulado (bronze no Azure já está atualizado)
+```
+
+Eventos de erro durante uma janela aparecem assim:
 
 ```
     ⏳ 202307 mod=4 pág=1 — 429, aguardando 30s (tentativa 2/5)
+    ⏳ 202201 mod=4 pág=1 — ConnectionError, aguardando 10s (tentativa 2/4)
     ⚠️  202307 mod=4 — HTTP 403 (pág=1): '...'
-    ❌ 202307 mod=4 pág=1 — desistindo (conexão falhou: ConnectionError)
+    ❌ 202201 mod=4 pág=1 — desistindo (conexão falhou (pág=1) após 4 tentativas: ConnectionError)
 ```
 
-- `⏳` = rate limit (429), o script está esperando e vai tentar de novo
-  automaticamente (até 5 tentativas)
+- `⏳ ... 429` = rate limit — o script espera (respeitando o header
+  `Retry-After` quando o PNCP manda) e tenta de novo automaticamente, até
+  5 tentativas
+- `⏳ ... ConnectionError/Timeout` = falha de conexão intermitente — o
+  script tenta de novo com espera crescente (5s, 10s, 15s, 20s) e uma
+  sessão HTTP nova a cada tentativa, até 4 tentativas
 - `⚠️` = status HTTP inesperado ou JSON inválido — a janela é abandonada e
-  registrada como evento, mas **não** entra no checkpoint, então será
-  retentada na próxima execução em modo `append`
-- `❌` = falha de conexão após 3 tentativas, mesmo comportamento acima
+  registrada como evento; como não houve sucesso, ela **não** entra no
+  checkpoint e será retentada na próxima execução em modo `append`
+- `❌` = desistência definitiva daquela janela após esgotar as tentativas
+  (429 ou conexão) — mesmo comportamento acima, não entra no checkpoint
 
 No final da ingestão aparece um bloco `=== Diagnóstico por modalidade ===`
 resumindo quantas janelas tiveram evento e quantos contratos foram
@@ -224,9 +262,34 @@ dado real ou sintoma de algo falhando.
 Aumente o `--delay` (ex: `--delay 3` ou mais) e rode de novo em modo
 `append` — o checkpoint evita retrabalho do que já deu certo.
 
+**Erro de conexão intermitente (`ConnectionError`)**
+Já tem retry automático embutido (até 4 tentativas, com espera crescente).
+Se mesmo assim continuar desistindo com frequência, pode ser
+instabilidade de rede da própria máquina/VM — vale testar
+`curl https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao` direto
+para isolar se o problema é da rede local ou da API.
+
+**Upload parece ter dado certo no log, mas não aparece no Azure**
+O log só imprime `✓ Upload OK` depois que o SDK confirma o envio — não é
+um log otimista. Antes de desconfiar do script, confira:
+1. Está olhando dentro da pasta virtual certa (`bronze/` ou `silver/`
+   dentro do container, não na raiz)?
+2. A `AZURE_STORAGE_CONNECTION_STRING`/`AZURE_STORAGE_ACCOUNT_NAME` no
+   `.env` aponta pra mesma storage account que você está navegando no
+   portal?
+3. Existe alguma política de *lifecycle management* na conta que expira
+   blobs automaticamente (comum em contas de "sandbox")?
+4. Confirme via `az storage blob list` (comando na seção de configuração
+   acima) em vez de confiar só no portal, que às vezes fica com cache
+   desatualizado.
+5. Confira se `AZURE_BLOB_PREFIX` está escrito com o mesmo nome exato no
+   `.env` e no script — um typo faz o prefixo virar vazio silenciosamente
+   (ver aviso na seção de configuração).
+
 **Quero rodar em background com log salvo em arquivo**
-Use `python -u` para garantir saída sem buffer:
+O script já força saída sem buffer (`print` com `flush=True`), mas por
+segurança use `python -u` também:
 
 ```bash
-python -u pncp_extract.py --anos 2022 2023 2024 > log.txt 2>&1 &
+python -u pncp.py --anos 2022 2023 2024 > log.txt 2>&1 &
 ```
